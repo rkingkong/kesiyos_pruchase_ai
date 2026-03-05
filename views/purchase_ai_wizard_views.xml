@@ -198,10 +198,10 @@
                     <!-- STAGE 4 — DONE -->
                     <group invisible="state != 'done'">
                         <div colspan="4" style="padding:16px;background:#d4edda;border-radius:6px;border:1px solid #c3e6cb">
-                            <h4 style="color:#155724">✅ Orden de Compra Confirmada</h4>
+                            <h4 style="color:#155724">✅ Borrador de Orden de Compra Creado</h4>
                             <p style="color:#155724;margin:0">
-                                La orden fue creada y confirmada exitosamente.
-                                Ya está lista para recibir mercadería.
+                                La orden fue creada en estado <b>Borrador</b>.
+                                Ábrela, revísala y confírmala cuando estés listo.
                             </p>
                         </div>
                         <field name="purchase_order_id" readonly="1" colspan="4"/>

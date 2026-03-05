@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="view_purchase_ai_product_wizard_form" model="ir.ui.view">
+        <field name="name">purchase.ai.product.wizard.form</field>
+        <field name="model">purchase.ai.product.wizard</field>
+        <field name="arch" type="xml">
+            <form string="🆕 Crear Nuevo Producto">
+                <sheet>
+                    <div class="kes-info" style="margin-bottom:16px;padding:10px;background:#fff3cd;border-left:4px solid #ffc107;border-radius:4px;">
+                        <b>Producto no encontrado en el catálogo.</b><br/>
+                        Completa los datos para crearlo en Odoo.
+                    </div>
+
+                    <group>
+                        <group string="Datos del Producto">
+                            <field name="product_name" string="Nombre del Producto"/>
+                            <field name="product_type" string="Tipo de Producto" widget="radio"/>
+                            <field name="categ_id" string="Categoría"/>
+                            <field name="uom_id" string="Unidad de Medida"/>
+                        </group>
+                        <group string="Referencia de la Factura">
+                            <field name="line_id" readonly="1" string="Línea de factura"/>
+                        </group>
+                    </group>
+                </sheet>
+                <footer>
+                    <button name="action_confirm_create"
+                            type="object"
+                            string="✅ Crear Producto"
+                            class="btn-primary"/>
+                    <button string="Cancelar" class="btn-secondary" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+</odoo>

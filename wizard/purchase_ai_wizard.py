@@ -1,16 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-kesiyos_purchase_ai — AI Invoice → Purchase Order Wizard
-Odoo 17 Community Edition compatible.
-
-Fixes vs previous version:
-  - No field is marked required=True at the model level (avoids Odoo 17 client-side
-    pre-validation of invisible fields, which caused "Campos no válidos: Fecha de Factura")
-  - action_go_back_to_review() replaces the broken type="action" footer button
-  - product.template type='consu' stays valid in Odoo 17
-  - Command helpers used where appropriate
-  - _reopen() returns the same record (no data loss on re-open)
-"""
 import json
 import logging
 import re
@@ -23,9 +11,6 @@ from odoo.exceptions import UserError, ValidationError
 
 _logger = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════════════════════════════
-# PROMPT 1 — Extract invoice / receipt data
-# ══════════════════════════════════════════════════════════════════════
 EXTRACTION_PROMPT = """
 Eres un experto en contabilidad guatemalteca y reconocimiento de documentos fiscales.
 Analiza el documento adjunto y extrae la información en formato JSON EXCLUSIVAMENTE.
@@ -66,9 +51,6 @@ Devuelve este esquema JSON exacto:
 }
 """
 
-# ══════════════════════════════════════════════════════════════════════
-# PROMPT 2 — Semantic product matching against catalog
-# ══════════════════════════════════════════════════════════════════════
 MATCHING_PROMPT_TEMPLATE = """Eres un experto en inventario para un restaurante guatemalteco (Kesiyos).
 Haz coincidir líneas de una factura con productos del ERP usando razonamiento semántico.
 
@@ -80,8 +62,6 @@ LÍNEAS DE FACTURA:
 
 INSTRUCCIONES:
 - Usa sinónimos, marcas, abreviaciones, equivalencias ES/EN.
-  Ejemplos: "Martin's Canola Oil 1L"→"Aceite de Cocina", "Pechuga Fresca kg"→"Pollo".
-- Para restaurantes: ingredientes crudos = materias primas del catálogo.
 - Criterios de confianza:
   "high"   (≥85): Auto-mapear sin revisión.
   "medium" (50-84): Sugerencia, requiere revisión.
@@ -108,14 +88,90 @@ limpio ideal para crear el producto en Odoo (ej: "Aceite de Cocina Canola").
 """
 
 
+class PurchaseAIProductWizard(models.TransientModel):
+    """
+    Mini-wizard that pops up when the user clicks 🆕 on a line.
+    Asks for product type and category before creating.
+    """
+    _name = 'purchase.ai.product.wizard'
+    _description = 'Crear Producto desde Factura IA'
+
+    line_id = fields.Many2one(
+        'purchase.ai.wizard.line', string='Línea', ondelete='cascade'
+    )
+    product_name = fields.Char(string='Nombre del Producto', required=True)
+    product_type = fields.Selection([
+        ('consu',   '📦 Consumible (sin rastreo de stock)'),
+        ('product', '🏭 Almacenable (con stock)'),
+        ('service', '🔧 Servicio'),
+    ], string='Tipo de Producto', required=True, default='consu')
+    categ_id = fields.Many2one(
+        'product.category', string='Categoría', required=True,
+        default=lambda self: self.env.ref(
+            'product.product_category_all', raise_if_not_found=False
+        ),
+    )
+    uom_id = fields.Many2one('uom.uom', string='Unidad de Medida')
+
+    @api.model
+    def default_get(self, fields_list):
+        res = super().default_get(fields_list)
+        # Pre-fill name and uom from the line
+        line_id = self.env.context.get('default_line_id')
+        if line_id:
+            line = self.env['purchase.ai.wizard.line'].browse(line_id)
+            res['product_name'] = line.suggested_product_name or line.description or ''
+            if line.uom_id:
+                res['uom_id'] = line.uom_id.id
+        return res
+
+    def action_confirm_create(self):
+        """Create the product and assign it back to the wizard line."""
+        self.ensure_one()
+        name = self.product_name.strip()
+        if not name:
+            raise UserError(_('El nombre del producto no puede estar vacío.'))
+
+        # Duplicate check
+        existing = self.env['product.product'].search(
+            [('name', '=ilike', name), ('purchase_ok', '=', True)], limit=1
+        )
+        if existing:
+            self.line_id.product_id = existing.id
+            self.line_id.match_confidence = 'manual'
+            self.line_id.match_reason = 'Producto existente encontrado al intentar crear'
+        else:
+            uom = self.uom_id or self.env.ref(
+                'uom.product_uom_unit', raise_if_not_found=False
+            )
+            product = self.env['product.product'].create({
+                'name':        name,
+                'type':        self.product_type,
+                'categ_id':    self.categ_id.id,
+                'purchase_ok': True,
+                'sale_ok':     False,
+                'uom_id':      uom.id if uom else False,
+                'uom_po_id':   uom.id if uom else False,
+            })
+            self.line_id.product_id = product.id
+            self.line_id.match_confidence = 'created'
+            self.line_id.match_reason = (
+                'Creado: %s · %s' % (
+                    dict(self._fields['product_type'].selection).get(self.product_type, ''),
+                    self.categ_id.name,
+                )
+            )
+
+        # Return to the main wizard
+        return self.line_id.wizard_id._reopen()
+
+
 class PurchaseAIWizardLine(models.TransientModel):
     _name = 'purchase.ai.wizard.line'
     _description = 'AI Invoice Line'
 
     wizard_id = fields.Many2one('purchase.ai.wizard', ondelete='cascade')
 
-    # ── Invoice data ─────────────────────────────────────────────────
-    # NOTE: No required=True here — validation happens in action_proceed_to_approve()
     description = fields.Char(string='Descripción (Factura)')
     product_code = fields.Char(string='Código Proveedor')
     quantity = fields.Float(string='Cantidad', default=1.0)
@@ -128,8 +184,6 @@ class PurchaseAIWizardLine(models.TransientModel):
         'account.tax', string='Impuestos',
         domain=[('type_tax_use', '=', 'purchase')],
     )
-
-    # ── Product match ────────────────────────────────────────────────
     product_id = fields.Many2one(
         'product.product', string='Producto Odoo',
         domain=[('purchase_ok', '=', True)],
@@ -144,8 +198,6 @@ class PurchaseAIWizardLine(models.TransientModel):
     ], string='Confianza', default='none', readonly=True)
     match_score = fields.Integer(string='%', readonly=True)
     match_reason = fields.Char(string='Razón', readonly=True)
-
-    # Suggested name for "create product" shortcut
     suggested_product_name = fields.Char(string='Nombre sugerido')
     needs_product = fields.Boolean(
         string='Sin producto', compute='_compute_needs_product', store=True
@@ -171,40 +223,21 @@ class PurchaseAIWizardLine(models.TransientModel):
 
     def action_create_product(self):
         """
-        Quick-create a purchasable product from the suggested name,
-        then assign it to this line and reopen the wizard.
+        Open the mini product wizard to ask type + category before creating.
         """
         self.ensure_one()
-        name = self.suggested_product_name or self.description
-        if not name:
-            raise UserError(_('No hay nombre disponible para crear el producto.'))
-
-        # Check for duplicates first
-        existing = self.env['product.product'].search(
-            [('name', '=ilike', name), ('purchase_ok', '=', True)], limit=1
-        )
-        if existing:
-            self.product_id = existing.id
-            self.match_confidence = 'manual'
-            self.match_reason = 'Producto existente encontrado al intentar crear'
-            return self.wizard_id._reopen()
-
-        # Default UOM
-        uom = self.uom_id or self.env.ref('uom.product_uom_unit', raise_if_not_found=False)
-
-        product = self.env['product.product'].create({
-            'name': name,
-            'purchase_ok': True,
-            'sale_ok': False,
-            'type': 'consu',
-            'uom_id': uom.id if uom else False,
-            'uom_po_id': uom.id if uom else False,
-            'default_code': '',
-        })
-        self.product_id = product.id
-        self.match_confidence = 'created'
-        self.match_reason = 'Producto creado desde la factura'
-        return self.wizard_id._reopen()
+        return {
+            'type':      'ir.actions.act_window',
+            'name':      '🆕 Crear Producto',
+            'res_model': 'purchase.ai.product.wizard',
+            'view_mode': 'form',
+            'target':    'new',
+            'context': {
+                'default_line_id':      self.id,
+                'default_product_name': self.suggested_product_name or self.description or '',
+                'default_uom_id':       self.uom_id.id if self.uom_id else False,
+            },
+        }
 
 
 class PurchaseAIWizard(models.TransientModel):
@@ -213,18 +246,11 @@ class PurchaseAIWizard(models.TransientModel):
       1. upload  — drop the document
       2. review  — AI extracts + matches; user corrects vendor/products
       3. approve — final checklist before committing
-      4. done    — PO confirmed and created
-
-    Odoo 17 key rules followed:
-      * NO field has required=True at model level (avoids pre-validation of invisible fields)
-      * <tree> → <list> in XML (handled in views)
-      * No attrs={} — direct Python expressions in invisible/required/readonly
-      * _reopen() always returns same record ID
+      4. done    — PO created in DRAFT state (user confirms manually)
     """
     _name = 'purchase.ai.wizard'
     _description = 'AI Invoice → Purchase Order Wizard'
 
-    # ── Stage ────────────────────────────────────────────────────────
     state = fields.Selection([
         ('upload',  '1. Subir'),
         ('review',  '2. Revisar'),
@@ -232,32 +258,26 @@ class PurchaseAIWizard(models.TransientModel):
         ('done',    '4. Completado'),
     ], default='upload', string='Etapa')
 
-    # ── File ─────────────────────────────────────────────────────────
-    # required=False at model level — the view enforces it only in 'upload' state
-    document_file = fields.Binary(
-        string='Factura / Recibo', attachment=False,
-    )
+    document_file = fields.Binary(string='Factura / Recibo', attachment=False)
     document_filename = fields.Char(string='Archivo')
     document_mimetype = fields.Char(compute='_compute_mimetype', store=True)
 
     @api.depends('document_filename')
     def _compute_mimetype(self):
         ext_map = {
-            'pdf': 'application/pdf',
-            'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
-            'png': 'image/png',  'webp': 'image/webp',
+            'pdf':  'application/pdf',
+            'jpg':  'image/jpeg', 'jpeg': 'image/jpeg',
+            'png':  'image/png',  'webp': 'image/webp',
         }
         for rec in self:
             ext = (rec.document_filename or '').rsplit('.', 1)[-1].lower()
             rec.document_mimetype = ext_map.get(ext, 'application/octet-stream')
 
-    # ── AI debug ─────────────────────────────────────────────────────
     ai_raw_json      = fields.Text(readonly=True)
     ai_matching_json = fields.Text(readonly=True)
     ai_error_message = fields.Char(readonly=True)
     matching_summary = fields.Html(readonly=True)
 
-    # ── Vendor (NIT-first) ───────────────────────────────────────────
     vendor_nit      = fields.Char(string='NIT Proveedor')
     vendor_name_raw = fields.Char(string='Nombre según Factura')
     vendor_id = fields.Many2one(
@@ -273,10 +293,6 @@ class PurchaseAIWizard(models.TransientModel):
     ], string='Estado Proveedor', readonly=True)
     vendor_address = fields.Char(string='Dirección (según factura)')
 
-    # ── Invoice header ───────────────────────────────────────────────
-    # IMPORTANT: No required=True — Odoo 17 validates required at form level even for
-    # invisible fields, which broke the "Analizar con IA" button in the upload stage.
-    # Validation is done programmatically in action_proceed_to_approve().
     invoice_number      = fields.Char(string='Número de Factura')
     fel_uuid            = fields.Char(string='UUID FEL / Autorización SAT')
     fel_serie           = fields.Char(string='Serie DTE')
@@ -292,24 +308,15 @@ class PurchaseAIWizard(models.TransientModel):
     total_amount        = fields.Float(string='Total',          digits=(16, 2))
     notes               = fields.Text(string='Observaciones')
 
-    # ── Lines ────────────────────────────────────────────────────────
-    line_ids = fields.One2many(
-        'purchase.ai.wizard.line', 'wizard_id', string='Líneas'
-    )
+    line_ids = fields.One2many('purchase.ai.wizard.line', 'wizard_id', string='Líneas')
 
-    # ── Approve-stage checklist ──────────────────────────────────────
     approve_vendor_ok  = fields.Boolean(string='✅ Proveedor verificado')
     approve_lines_ok   = fields.Boolean(string='✅ Líneas y productos verificados')
     approve_amounts_ok = fields.Boolean(string='✅ Montos verificados')
     approve_notes      = fields.Text(string='Notas de aprobación (opcional)')
 
-    # ── Computed readiness ───────────────────────────────────────────
-    all_lines_have_product = fields.Boolean(
-        compute='_compute_readiness', string='Todas las líneas tienen producto'
-    )
-    unmatched_count = fields.Integer(
-        compute='_compute_readiness', string='Líneas sin producto'
-    )
+    all_lines_have_product = fields.Boolean(compute='_compute_readiness')
+    unmatched_count = fields.Integer(compute='_compute_readiness')
 
     @api.depends('line_ids', 'line_ids.product_id')
     def _compute_readiness(self):
@@ -318,11 +325,10 @@ class PurchaseAIWizard(models.TransientModel):
             rec.unmatched_count = len(without)
             rec.all_lines_have_product = len(without) == 0
 
-    # ── Result ───────────────────────────────────────────────────────
     purchase_order_id = fields.Many2one('purchase.order', readonly=True)
 
     # ════════════════════════════════════════════════════════════════
-    # STAGE 1 → 2  :  Analyze document
+    # STAGE 1 → 2
     # ════════════════════════════════════════════════════════════════
     def action_analyze_with_ai(self):
         self.ensure_one()
@@ -332,7 +338,6 @@ class PurchaseAIWizard(models.TransientModel):
         api_key = self._get_api_key()
         model   = self._get_model()
 
-        # Phase 1 — Extract
         _logger.info('Kesiyos AI P1: extracting %s', self.document_filename)
         raw = self._call_claude_api(api_key, {
             'model': model, 'max_tokens': 2048,
@@ -351,7 +356,6 @@ class PurchaseAIWizard(models.TransientModel):
         invoice_lines = data.get('lines') or []
         line_vals = self._build_line_vals(invoice_lines)
 
-        # Phase 2 — Match
         catalog = self._get_product_catalog()
         _logger.info('Kesiyos AI P2: matching %d lines vs %d products',
                      len(invoice_lines), len(catalog))
@@ -370,10 +374,9 @@ class PurchaseAIWizard(models.TransientModel):
         return self._reopen()
 
     # ════════════════════════════════════════════════════════════════
-    # Vendor: NIT lookup + create
+    # Vendor helpers
     # ════════════════════════════════════════════════════════════════
     def action_lookup_vendor_by_nit(self):
-        """Search res.partner by NIT. Called after extraction and manually."""
         self.ensure_one()
         nit = (self.vendor_nit or '').strip()
         if not nit:
@@ -403,7 +406,6 @@ class PurchaseAIWizard(models.TransientModel):
         return self._reopen()
 
     def action_create_vendor(self):
-        """Create a new supplier from extracted NIT + name."""
         self.ensure_one()
         name = self.vendor_name_raw or ''
         if not name:
@@ -441,15 +443,13 @@ class PurchaseAIWizard(models.TransientModel):
             self.vendor_state = 'manual'
 
     # ════════════════════════════════════════════════════════════════
-    # STAGE 2 → 3  :  Move to approval
+    # STAGE 2 → 3
     # ════════════════════════════════════════════════════════════════
     def action_proceed_to_approve(self):
         self.ensure_one()
         errors = []
         if not self.vendor_id:
-            errors.append(_(
-                '• Falta el Proveedor — usa "Buscar por NIT" o selecciónalo manualmente.'
-            ))
+            errors.append(_('• Falta el Proveedor.'))
         if not self.invoice_date:
             errors.append(_('• Falta la Fecha de Factura.'))
         if not self.line_ids:
@@ -461,9 +461,7 @@ class PurchaseAIWizard(models.TransientModel):
         return self._reopen()
 
     # ════════════════════════════════════════════════════════════════
-    # STAGE 3 → 2  :  Go back to review (Odoo 17 safe)
-    # This replaces the broken type="action" footer button that opened
-    # a brand-new wizard (losing all extracted data).
+    # STAGE 3 → 2
     # ════════════════════════════════════════════════════════════════
     def action_go_back_to_review(self):
         self.ensure_one()
@@ -471,7 +469,7 @@ class PurchaseAIWizard(models.TransientModel):
         return self._reopen()
 
     # ════════════════════════════════════════════════════════════════
-    # STAGE 3 → 4  :  Approve and create PO
+    # STAGE 3 → 4  — PO created in DRAFT (not confirmed)
     # ════════════════════════════════════════════════════════════════
     def action_approve_and_create_po(self):
         self.ensure_one()
@@ -484,47 +482,46 @@ class PurchaseAIWizard(models.TransientModel):
         if not self.vendor_id:
             raise ValidationError(_('Selecciona un proveedor antes de aprobar.'))
 
-        tax = self._default_tax()
+        tax  = self._default_tax()
         misc = self._misc_product()
 
         po_lines = []
         for line in self.line_ids:
             product = line.product_id or misc
-            uom = line.uom_id or product.uom_po_id or product.uom_id
-            taxes = line.tax_ids or (tax if tax else self.env['account.tax'])
+            uom     = line.uom_id or product.uom_po_id or product.uom_id
+            taxes   = line.tax_ids or (tax if tax else self.env['account.tax'])
             po_lines.append((0, 0, {
-                'product_id':          product.id,
-                'name':                line.description or product.name,
-                'product_qty':         line.quantity,
-                'product_uom':         uom.id if uom else False,
-                'price_unit':          line.unit_price,
-                'taxes_id':            [(6, 0, taxes.ids)],
-                'date_planned':        fields.Date.today(),
+                'product_id':   product.id,
+                'name':         line.description or product.name,
+                'product_qty':  line.quantity,
+                'product_uom':  uom.id if uom else False,
+                'price_unit':   line.unit_price,
+                'taxes_id':     [(6, 0, taxes.ids)],
+                'date_planned': fields.Date.today(),
             }))
 
-        po_vals = {
-            'partner_id':      self.vendor_id.id,
-            'partner_ref':     self.invoice_number or False,
-            'date_order':      fields.Datetime.now(),
-            'currency_id':     self.currency_id.id if self.currency_id else False,
-            'notes':           self._po_notes(),
-            'order_line':      po_lines,
-        }
-        po = self.env['purchase.order'].create(po_vals)
+        po = self.env['purchase.order'].create({
+            'partner_id':  self.vendor_id.id,
+            'partner_ref': self.invoice_number or False,
+            'date_order':  fields.Datetime.now(),
+            'currency_id': self.currency_id.id if self.currency_id else False,
+            'notes':       self._po_notes(),
+            'order_line':  po_lines,
+        })
 
-        # Attach original document to the PO
+        # Attach original document
         if self.document_file and self.document_filename:
             self.env['ir.attachment'].create({
-                'name':        self.document_filename,
-                'datas':       self.document_file,
-                'res_model':   'purchase.order',
-                'res_id':      po.id,
-                'mimetype':    self.document_mimetype,
+                'name':      self.document_filename,
+                'datas':     self.document_file,
+                'res_model': 'purchase.order',
+                'res_id':    po.id,
+                'mimetype':  self.document_mimetype,
             })
 
-        # Confirm immediately — no draft
-        po.button_confirm()
-        _logger.info('Kesiyos AI: PO %s confirmed for %s', po.name, self.vendor_id.name)
+        # ── DRAFT — user confirms manually from the PO ──
+        # po.button_confirm() is intentionally NOT called here.
+        _logger.info('Kesiyos AI: PO %s created in DRAFT for %s', po.name, self.vendor_id.name)
 
         self.purchase_order_id = po.id
         self.state = 'done'
@@ -541,7 +538,7 @@ class PurchaseAIWizard(models.TransientModel):
         }
 
     # ════════════════════════════════════════════════════════════════
-    # Product catalog + matching helpers
+    # Product catalog + matching
     # ════════════════════════════════════════════════════════════════
     def _get_product_catalog(self):
         products = self.env['product.product'].search(
@@ -581,7 +578,6 @@ class PurchaseAIWizard(models.TransientModel):
             result = json.loads(raw)
             return result if isinstance(result, list) else []
         except json.JSONDecodeError:
-            _logger.warning('Matching JSON parse error: %s', raw)
             return []
 
     def _populate_header(self, data):
@@ -606,7 +602,6 @@ class PurchaseAIWizard(models.TransientModel):
         self.tax_amount          = float(data.get('tax_amount') or 0)
         self.total_amount        = float(data.get('total_amount') or 0)
 
-        # Auto-lookup vendor by NIT after extraction
         if self.vendor_nit:
             nit   = self.vendor_nit.strip()
             clean = nit.replace('-', '').replace(' ', '')
@@ -632,7 +627,7 @@ class PurchaseAIWizard(models.TransientModel):
                 self.vendor_state = 'not_found'
 
     def _build_line_vals(self, invoice_lines):
-        tax  = self._default_tax()
+        tax = self._default_tax()
         result = []
         for line in invoice_lines:
             uom_name = (line.get('unit_of_measure') or '').strip().lower()
@@ -642,22 +637,21 @@ class PurchaseAIWizard(models.TransientModel):
                     [('name', 'ilike', uom_name)], limit=1
                 )
             lv = {
-                'description':          line.get('description') or '',
-                'product_code':         line.get('product_code') or '',
-                'quantity':             float(line.get('quantity') or 1),
-                'unit_price':           float(line.get('unit_price') or 0),
-                'match_confidence':     'none',
-                'match_score':          0,
-                'match_reason':         '',
+                'description':           line.get('description') or '',
+                'product_code':          line.get('product_code') or '',
+                'quantity':              float(line.get('quantity') or 1),
+                'unit_price':            float(line.get('unit_price') or 0),
+                'match_confidence':      'none',
+                'match_score':           0,
+                'match_reason':          '',
                 'suggested_product_name': '',
             }
-            if uom:  lv['uom_id']  = uom.id
-            if tax:  lv['tax_ids'] = [(6, 0, tax.ids)]
+            if uom: lv['uom_id']  = uom.id
+            if tax: lv['tax_ids'] = [(6, 0, tax.ids)]
             result.append((0, 0, lv))
         return result
 
     def _apply_matches(self, line_vals, matches):
-        """Overlay AI matching results onto the line_vals list."""
         for m in matches:
             idx = m.get('line_index')
             if idx is None or idx >= len(line_vals):
@@ -669,9 +663,9 @@ class PurchaseAIWizard(models.TransientModel):
             prod_id    = m.get('product_odoo_id')
             suggested  = m.get('suggested_new_product_name') or ''
 
-            lv['match_confidence']     = confidence
-            lv['match_score']          = score
-            lv['match_reason']         = reason
+            lv['match_confidence']      = confidence
+            lv['match_score']           = score
+            lv['match_reason']          = reason
             lv['suggested_product_name'] = suggested
 
             if prod_id and confidence in ('high', 'medium'):
@@ -697,9 +691,6 @@ class PurchaseAIWizard(models.TransientModel):
             '</div>'
         )
 
-    # ════════════════════════════════════════════════════════════════
-    # PO helpers
-    # ════════════════════════════════════════════════════════════════
     def _default_tax(self):
         param = self.env['ir.config_parameter'].sudo().get_param(
             'kesiyos_purchase_ai.default_tax_id'
@@ -726,30 +717,27 @@ class PurchaseAIWizard(models.TransientModel):
         return '\n'.join(parts)
 
     def _misc_product(self):
-        """Fallback product for lines without a matched product."""
         p = self.env['product.product'].search(
             [('default_code', '=', 'KES-MISC')], limit=1
         )
         if not p:
             p = self.env['product.product'].create({
-                'name': 'Compra Miscelánea / Genérico',
+                'name':        'Compra Miscelánea / Genérico',
                 'default_code': 'KES-MISC',
-                'type': 'service',
+                'type':        'service',
                 'purchase_ok': True,
-                'sale_ok': False,
+                'sale_ok':     False,
             })
         return p
 
-    # ════════════════════════════════════════════════════════════════
-    # Claude API helpers
-    # ════════════════════════════════════════════════════════════════
     def _get_api_key(self):
         k = self.env['ir.config_parameter'].sudo().get_param(
             'kesiyos_purchase_ai.claude_api_key'
         )
         if not k:
             raise UserError(_(
-                'Falta la Claude API Key.\nVe a Configuración → Compra → Kesiyos AI.'
+                'Falta la Claude API Key.\n'
+                'Ve a Configuración → Técnico → Parámetros del Sistema.'
             ))
         return k
 
@@ -764,29 +752,20 @@ class PurchaseAIWizard(models.TransientModel):
             data = data.decode('utf-8')
         mt = self.document_mimetype
         if mt == 'application/pdf':
-            return {
-                'type': 'document',
-                'source': {'type': 'base64', 'media_type': mt, 'data': data},
-            }
+            return {'type': 'document', 'source': {'type': 'base64', 'media_type': mt, 'data': data}}
         if mt in ('image/jpeg', 'image/png', 'image/webp', 'image/gif'):
-            return {
-                'type': 'image',
-                'source': {'type': 'base64', 'media_type': mt, 'data': data},
-            }
+            return {'type': 'image', 'source': {'type': 'base64', 'media_type': mt, 'data': data}}
         raise UserError(_('Formato no soportado: %s') % self.document_filename)
 
     def _call_claude_api(self, api_key, payload):
         url = 'https://api.anthropic.com/v1/messages'
         headers = {
-            'Content-Type':       'application/json',
-            'x-api-key':          api_key,
-            'anthropic-version':  '2023-06-01',
+            'Content-Type':      'application/json',
+            'x-api-key':         api_key,
+            'anthropic-version': '2023-06-01',
         }
         req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode(),
-            headers=headers,
-            method='POST',
+            url, data=json.dumps(payload).encode(), headers=headers, method='POST'
         )
         try:
             with urllib.request.urlopen(req, timeout=90) as resp:
@@ -796,23 +775,18 @@ class PurchaseAIWizard(models.TransientModel):
             _logger.error('Claude HTTP %s: %s', e.code, body)
             raise UserError(_('Error Claude API (HTTP %s):\n%s') % (e.code, body))
         except urllib.error.URLError as e:
-            raise UserError(_('Error de red al llamar Claude: %s') % str(e.reason))
+            raise UserError(_('Error de red: %s') % str(e.reason))
 
         try:
             text = rd['content'][0]['text']
         except (KeyError, IndexError):
             raise UserError(_('Respuesta inesperada de Claude: %s') % str(rd))
 
-        # Strip markdown fences if Claude wraps in ```json ... ```
         text = re.sub(r'^```(?:json)?\s*', '', text.strip())
         text = re.sub(r'\s*```$', '', text.strip())
         return text.strip()
 
     def _reopen(self):
-        """
-        Return the same wizard record in a new dialog.
-        Always uses res_id=self.id so no data is lost.
-        """
         return {
             'type':      'ir.actions.act_window',
             'res_model': self._name,
