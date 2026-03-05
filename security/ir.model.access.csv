@@ -3,5 +3,3 @@ access_purchase_ai_wizard,purchase.ai.wizard user,model_purchase_ai_wizard,purch
 access_purchase_ai_wizard_manager,purchase.ai.wizard manager,model_purchase_ai_wizard,purchase.group_purchase_manager,1,1,1,1
 access_purchase_ai_wizard_line,purchase.ai.wizard.line user,model_purchase_ai_wizard_line,purchase.group_purchase_user,1,1,1,1
 access_purchase_ai_wizard_line_manager,purchase.ai.wizard.line manager,model_purchase_ai_wizard_line,purchase.group_purchase_manager,1,1,1,1
-access_purchase_ai_product_wizard,purchase.ai.product.wizard user,model_purchase_ai_product_wizard,purchase.group_purchase_user,1,1,1,1
-access_purchase_ai_product_wizard_manager,purchase.ai.product.wizard manager,model_purchase_ai_product_wizard,purchase.group_purchase_manager,1,1,1,1
