@@ -22,8 +22,11 @@
 
                 <sheet>
 
-                    <!-- STAGE 1 — UPLOAD -->
+                    <!-- ══════════════════════════════════════════════
+                         STAGE 1 — UPLOAD
+                         ══════════════════════════════════════════════ -->
                     <group invisible="state != 'upload'">
+
                         <group string="📄 Subir Documento">
                             <field name="document_file"
                                    widget="binary"
@@ -33,28 +36,41 @@
                             <field name="document_filename" invisible="1"/>
                             <field name="document_mimetype" invisible="1"/>
                         </group>
-                        <group string="Cómo funciona">
-                            <div class="kes-info">
-                                <b>Formatos:</b> PDF · JPG · PNG · WEBP<br/>
-                                <b>Fase 1 — Extracción:</b> Claude lee la factura y extrae
-                                proveedor, NIT, UUID FEL, líneas, IVA y totales.<br/>
-                                <b>Fase 2 — Matching IA:</b> Compara cada línea contra tu
-                                catálogo de productos con nivel de confianza.<br/>
-                                <b>Fase 3 — Revisión:</b> Tú corriges, buscas o creas los
-                                productos y el proveedor que falten.<br/>
-                                <b>Fase 4 — Aprobación:</b> Un solo clic confirma la
-                                Orden de Compra — sin borradores incompletos.
+
+                        <!-- Viáticos toggle -->
+                        <group string="⚙️ Opciones de Procesamiento">
+                            <field name="is_viaticos" string="💼 Agrupar todo como Viáticos / Gasto General"/>
+                            <div invisible="not is_viaticos"
+                                 style="padding:10px;background:#d1ecf1;border-left:4px solid #17a2b8;border-radius:4px;margin-top:4px;">
+                                <b>Modo Viáticos activado.</b><br/>
+                                No se hará matching de productos. Todas las líneas de la
+                                factura se agruparán en <b>una sola línea</b> usando el
+                                producto <b>Viáticos</b>, con la descripción completa
+                                de cada ítem como detalle.
+                                <br/>Ideal para: gastos del dueño, viáticos, representación,
+                                servicios varios.
+                            </div>
+                            <div invisible="is_viaticos"
+                                 style="padding:10px;background:#f0f4ff;border-left:4px solid #6c8ebf;border-radius:4px;margin-top:4px;">
+                                <b>Modo normal.</b><br/>
+                                La IA extraerá cada línea y buscará coincidencias en tu
+                                catálogo de productos. Podrás revisar y corregir antes de
+                                crear la Orden de Compra.
                             </div>
                         </group>
+
                     </group>
 
-                    <!-- STAGE 2 — REVIEW -->
+                    <!-- ══════════════════════════════════════════════
+                         STAGE 2 — REVIEW
+                         ══════════════════════════════════════════════ -->
                     <group invisible="state not in ('review', 'approve')">
 
                         <div invisible="not matching_summary" colspan="4">
                             <field name="matching_summary" widget="html" nolabel="1"/>
                         </div>
 
+                        <!-- Vendor block -->
                         <group string="🏪 Proveedor" colspan="4">
                             <group>
                                 <field name="vendor_nit" string="NIT"/>
@@ -84,6 +100,7 @@
                             </div>
                         </group>
 
+                        <!-- Invoice header -->
                         <group string="📋 Factura">
                             <field name="invoice_number"/>
                             <field name="invoice_date"
@@ -98,6 +115,7 @@
                             <field name="total_amount" string="Total"/>
                         </group>
 
+                        <!-- Lines -->
                         <notebook colspan="4">
                             <page string="📦 Líneas de Factura">
                                 <field name="line_ids" nolabel="1">
@@ -119,7 +137,7 @@
                                         <button name="action_create_product"
                                                 type="object"
                                                 string="🆕"
-                                                title="Crear producto desde sugerencia"
+                                                title="Asignar producto"
                                                 invisible="product_id != False"
                                                 class="btn-sm btn-outline-primary"/>
                                         <field name="product_code" string="Cód. Proveedor" optional="hide"/>
@@ -137,7 +155,7 @@
                                 <div invisible="unmatched_count == 0"
                                      style="margin-top:6px;color:#dc3545;font-size:0.9em">
                                     ⚠️ <field name="unmatched_count" nolabel="1"
-                                              style="display:inline;font-weight:bold"/> línea(s) sin producto asignado.
+                                              style="display:inline;font-weight:bold"/> línea(s) sin producto.
                                     Asígnales un producto manualmente o usa el botón 🆕.
                                 </div>
                             </page>
@@ -157,12 +175,20 @@
 
                     </group>
 
-                    <!-- STAGE 3 — APPROVE -->
+                    <!-- ══════════════════════════════════════════════
+                         STAGE 3 — APPROVE
+                         ══════════════════════════════════════════════ -->
                     <group invisible="state != 'approve'">
 
                         <div class="kes-info" colspan="4" style="margin-bottom:12px">
                             <b>Revisa los puntos a continuación y marca cada casilla.</b><br/>
-                            La Orden de Compra se creará y confirmará inmediatamente al aprobar.
+                            La Orden de Compra se creará en estado <b>Borrador</b>.
+                        </div>
+
+                        <!-- Viáticos reminder in approve stage -->
+                        <div invisible="not is_viaticos" colspan="4"
+                             style="padding:10px;background:#d1ecf1;border-left:4px solid #17a2b8;border-radius:4px;margin-bottom:8px;">
+                            💼 <b>Modo Viáticos</b> — Esta orden se registrará como gasto general.
                         </div>
 
                         <group string="📋 Resumen" colspan="4">
@@ -179,9 +205,20 @@
                                 <field name="unmatched_count" readonly="1" string="Líneas sin producto"/>
                                 <div invisible="unmatched_count == 0"
                                      style="color:#dc3545;font-size:0.85em">
-                                    ⚠️ Hay líneas sin producto — se usará KES-MISC (genérico).
+                                    ⚠️ Líneas sin producto usarán KES-MISC (genérico).
                                 </div>
                             </group>
+                        </group>
+
+                        <group string="📊 Cuenta Analítica (Opcional)" colspan="4">
+                            <field name="analytic_account_id"
+                                   string="Cuenta Analítica"
+                                   options="{'no_quick_create': false}"
+                                   placeholder="Dejar vacío si no aplica..."/>
+                            <div invisible="not analytic_account_id"
+                                 style="color:#155724;font-size:0.85em;margin-top:4px">
+                                ✅ Se aplicará al 100% en todas las líneas de la orden.
+                            </div>
                         </group>
 
                         <group string="✅ Checklist de Aprobación" colspan="4">
@@ -195,7 +232,9 @@
 
                     </group>
 
-                    <!-- STAGE 4 — DONE -->
+                    <!-- ══════════════════════════════════════════════
+                         STAGE 4 — DONE
+                         ══════════════════════════════════════════════ -->
                     <group invisible="state != 'done'">
                         <div colspan="4" style="padding:16px;background:#d4edda;border-radius:6px;border:1px solid #c3e6cb">
                             <h4 style="color:#155724">✅ Borrador de Orden de Compra Creado</h4>
@@ -210,12 +249,14 @@
                 </sheet>
 
                 <footer>
+                    <!-- Stage 1 -->
                     <button name="action_analyze_with_ai"
                             type="object"
                             string="🔍 Analizar con IA"
                             class="btn-primary"
                             invisible="state != 'upload'"/>
 
+                    <!-- Stage 2 -->
                     <button name="action_analyze_with_ai"
                             type="object"
                             string="🔄 Re-Analizar"
@@ -227,6 +268,7 @@
                             class="btn-primary"
                             invisible="state != 'review'"/>
 
+                    <!-- Stage 3 -->
                     <button name="action_go_back_to_review"
                             type="object"
                             string="← Volver a Revisar"
@@ -238,6 +280,7 @@
                             class="btn-success"
                             invisible="state != 'approve'"/>
 
+                    <!-- Stage 4 -->
                     <button name="action_open_po"
                             type="object"
                             string="📋 Ver Orden de Compra"

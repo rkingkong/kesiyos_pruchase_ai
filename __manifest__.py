@@ -3,9 +3,6 @@
     'name': 'Kesiyos - AI Purchase Invoice Scanner',
     'version': '17.0.3.0.0',
     'category': 'Purchase',
-<<<<<<< HEAD
-    'summary': 'Scan FEL invoices with Claude AI → Draft Purchase Orders',
-=======
     'summary': 'Scan FEL invoices & receipts with Claude AI to create confirmed Purchase Orders',
     'description': """
 Kesiyos AI Purchase Scanner — Odoo 17
@@ -23,7 +20,6 @@ Configuration:
     - kesiyos_purchase_ai.ai_model
     - kesiyos_purchase_ai.default_tax_id
     """,
->>>>>>> refs/remotes/origin/main
     'author': 'Kesiyos',
     'website': 'https://kesiyos.com',
     'depends': ['base', 'purchase', 'account', 'uom'],

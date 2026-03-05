@@ -84,29 +84,34 @@ Responde SOLO con el array JSON (sin texto, sin markdown):
 ]
 
 IMPORTANTE: Si no hay match (low/none), llena "suggested_new_product_name" con el nombre
-limpio ideal para crear el producto en Odoo (ej: "Aceite de Cocina Canola").
+limpio ideal para crear el producto en Odoo.
 """
 
 
 class PurchaseAIProductWizard(models.TransientModel):
     """
     Mini-wizard that pops up when the user clicks 🆕 on a line.
-    Asks for product type and category before creating.
+    Options: use Viáticos generic, OR create a new product (type + category).
     """
     _name = 'purchase.ai.product.wizard'
-    _description = 'Crear Producto desde Factura IA'
+    _description = 'Asignar Producto a Línea IA'
 
     line_id = fields.Many2one(
         'purchase.ai.wizard.line', string='Línea', ondelete='cascade'
     )
-    product_name = fields.Char(string='Nombre del Producto', required=True)
+    action = fields.Selection([
+        ('viaticos', '💼 Usar Viáticos / Gasto General'),
+        ('create',   '🆕 Crear nuevo producto en el catálogo'),
+    ], string='¿Qué hacer con esta línea?', required=True, default='create')
+
+    product_name = fields.Char(string='Nombre del Producto')
     product_type = fields.Selection([
         ('consu',   '📦 Consumible (sin rastreo de stock)'),
         ('product', '🏭 Almacenable (con stock)'),
         ('service', '🔧 Servicio'),
-    ], string='Tipo de Producto', required=True, default='consu')
+    ], string='Tipo de Producto', default='consu')
     categ_id = fields.Many2one(
-        'product.category', string='Categoría', required=True,
+        'product.category', string='Categoría',
         default=lambda self: self.env.ref(
             'product.product_category_all', raise_if_not_found=False
         ),
@@ -116,7 +121,6 @@ class PurchaseAIProductWizard(models.TransientModel):
     @api.model
     def default_get(self, fields_list):
         res = super().default_get(fields_list)
-        # Pre-fill name and uom from the line
         line_id = self.env.context.get('default_line_id')
         if line_id:
             line = self.env['purchase.ai.wizard.line'].browse(line_id)
@@ -125,66 +129,83 @@ class PurchaseAIProductWizard(models.TransientModel):
                 res['uom_id'] = line.uom_id.id
         return res
 
-    def action_confirm_create(self):
-        """Create the product and assign it back to the wizard line."""
+    def action_confirm(self):
         self.ensure_one()
-        name = self.product_name.strip()
-        if not name:
-            raise UserError(_('El nombre del producto no puede estar vacío.'))
-
-        # Duplicate check
-        existing = self.env['product.product'].search(
-            [('name', '=ilike', name), ('purchase_ok', '=', True)], limit=1
-        )
-        if existing:
-            self.line_id.product_id = existing.id
+        if self.action == 'viaticos':
+            viat = self._get_viaticos_product()
+            self.line_id.product_id = viat.id
             self.line_id.match_confidence = 'manual'
-            self.line_id.match_reason = 'Producto existente encontrado al intentar crear'
+            self.line_id.match_reason = '💼 Viáticos / Gasto General'
         else:
-            uom = self.uom_id or self.env.ref(
-                'uom.product_uom_unit', raise_if_not_found=False
+            name = (self.product_name or '').strip()
+            if not name:
+                raise UserError(_('El nombre del producto no puede estar vacío.'))
+            existing = self.env['product.product'].search(
+                [('name', '=ilike', name), ('purchase_ok', '=', True)], limit=1
             )
-            product = self.env['product.product'].create({
-                'name':        name,
-                'type':        self.product_type,
-                'categ_id':    self.categ_id.id,
-                'purchase_ok': True,
-                'sale_ok':     False,
-                'uom_id':      uom.id if uom else False,
-                'uom_po_id':   uom.id if uom else False,
-            })
-            self.line_id.product_id = product.id
-            self.line_id.match_confidence = 'created'
-            self.line_id.match_reason = (
-                'Creado: %s · %s' % (
-                    dict(self._fields['product_type'].selection).get(self.product_type, ''),
-                    self.categ_id.name,
+            if existing:
+                self.line_id.product_id = existing.id
+                self.line_id.match_confidence = 'manual'
+                self.line_id.match_reason = 'Producto existente encontrado'
+            else:
+                if not self.product_type:
+                    raise UserError(_('Selecciona el tipo de producto.'))
+                uom = self.uom_id or self.env.ref('uom.product_uom_unit', raise_if_not_found=False)
+                product = self.env['product.product'].create({
+                    'name':        name,
+                    'type':        self.product_type,
+                    'categ_id':    self.categ_id.id if self.categ_id else False,
+                    'purchase_ok': True,
+                    'sale_ok':     False,
+                    'uom_id':      uom.id if uom else False,
+                    'uom_po_id':   uom.id if uom else False,
+                })
+                self.line_id.product_id = product.id
+                self.line_id.match_confidence = 'created'
+                type_label = dict(self._fields['product_type'].selection).get(self.product_type, '')
+                self.line_id.match_reason = '🆕 Creado: %s · %s' % (
+                    type_label, self.categ_id.name if self.categ_id else ''
                 )
-            )
-
-        # Return to the main wizard
         return self.line_id.wizard_id._reopen()
+
+    def _get_viaticos_product(self):
+        """Find the Viáticos service product — by code KES-VIAT first, then by name."""
+        p = self.env['product.product'].search(
+            [('default_code', '=', 'KES-VIAT'), ('purchase_ok', '=', True)], limit=1
+        )
+        if not p:
+            p = self.env['product.product'].search(
+                [('name', 'ilike', 'viático'), ('type', '=', 'service'),
+                 ('purchase_ok', '=', True)], limit=1
+            )
+        if not p:
+            # Create it if still not found
+            p = self.env['product.product'].create({
+                'name':         'Viáticos / Gasto General',
+                'default_code': 'KES-VIAT',
+                'type':         'service',
+                'purchase_ok':  True,
+                'sale_ok':      False,
+            })
+        return p
 
 
 class PurchaseAIWizardLine(models.TransientModel):
     _name = 'purchase.ai.wizard.line'
     _description = 'AI Invoice Line'
 
-    wizard_id = fields.Many2one('purchase.ai.wizard', ondelete='cascade')
-
-    description = fields.Char(string='Descripción (Factura)')
-    product_code = fields.Char(string='Código Proveedor')
-    quantity = fields.Float(string='Cantidad', default=1.0)
-    uom_id = fields.Many2one('uom.uom', string='Unidad')
-    unit_price = fields.Float(string='Precio Unit.', digits=(16, 4))
-    line_total = fields.Float(
-        string='Subtotal', compute='_compute_line_total', store=True
-    )
-    tax_ids = fields.Many2many(
+    wizard_id        = fields.Many2one('purchase.ai.wizard', ondelete='cascade')
+    description      = fields.Char(string='Descripción (Factura)')
+    product_code     = fields.Char(string='Código Proveedor')
+    quantity         = fields.Float(string='Cantidad', default=1.0)
+    uom_id           = fields.Many2one('uom.uom', string='Unidad')
+    unit_price       = fields.Float(string='Precio Unit.', digits=(16, 4))
+    line_total       = fields.Float(string='Subtotal', compute='_compute_line_total', store=True)
+    tax_ids          = fields.Many2many(
         'account.tax', string='Impuestos',
         domain=[('type_tax_use', '=', 'purchase')],
     )
-    product_id = fields.Many2one(
+    product_id       = fields.Many2one(
         'product.product', string='Producto Odoo',
         domain=[('purchase_ok', '=', True)],
     )
@@ -196,11 +217,11 @@ class PurchaseAIWizardLine(models.TransientModel):
         ('manual',  '✋ Manual'),
         ('created', '🆕 Creado'),
     ], string='Confianza', default='none', readonly=True)
-    match_score = fields.Integer(string='%', readonly=True)
-    match_reason = fields.Char(string='Razón', readonly=True)
+    match_score           = fields.Integer(string='%', readonly=True)
+    match_reason          = fields.Char(string='Razón', readonly=True)
     suggested_product_name = fields.Char(string='Nombre sugerido')
-    needs_product = fields.Boolean(
-        string='Sin producto', compute='_compute_needs_product', store=True
+    needs_product         = fields.Boolean(
+        compute='_compute_needs_product', store=True
     )
 
     @api.depends('product_id')
@@ -222,13 +243,10 @@ class PurchaseAIWizardLine(models.TransientModel):
                 self.uom_id = self.product_id.uom_po_id
 
     def action_create_product(self):
-        """
-        Open the mini product wizard to ask type + category before creating.
-        """
         self.ensure_one()
         return {
             'type':      'ir.actions.act_window',
-            'name':      '🆕 Crear Producto',
+            'name':      '📦 Asignar Producto',
             'res_model': 'purchase.ai.product.wizard',
             'view_mode': 'form',
             'target':    'new',
@@ -243,10 +261,10 @@ class PurchaseAIWizardLine(models.TransientModel):
 class PurchaseAIWizard(models.TransientModel):
     """
     4-stage pipeline:
-      1. upload  — drop the document
-      2. review  — AI extracts + matches; user corrects vendor/products
-      3. approve — final checklist before committing
-      4. done    — PO created in DRAFT state (user confirms manually)
+      1. upload  — drop the document + optional Viáticos mode
+      2. review  — AI extracts + matches; user corrects
+      3. approve — analytic account + checklist
+      4. done    — PO created in DRAFT
     """
     _name = 'purchase.ai.wizard'
     _description = 'AI Invoice → Purchase Order Wizard'
@@ -258,9 +276,26 @@ class PurchaseAIWizard(models.TransientModel):
         ('done',    '4. Completado'),
     ], default='upload', string='Etapa')
 
-    document_file = fields.Binary(string='Factura / Recibo', attachment=False)
+    # ── Upload options ────────────────────────────────────────────
+    document_file     = fields.Binary(string='Factura / Recibo', attachment=False)
     document_filename = fields.Char(string='Archivo')
     document_mimetype = fields.Char(compute='_compute_mimetype', store=True)
+
+    # ── VIÁTICOS MODE ─────────────────────────────────────────────
+    # When checked: after AI extraction, ALL lines are collapsed into
+    # ONE line using the Viáticos service product.
+    # All individual descriptions are joined into one summary description.
+    # No product matching is run. Fast path for owner expenses / travel costs.
+    is_viaticos = fields.Boolean(
+        string='💼 Agrupar como Viáticos / Gasto General',
+        default=False,
+        help=(
+            'Marca esta opción cuando la factura corresponde a gastos generales, '
+            'viáticos o costos del dueño que no necesitan desglose por producto.\n\n'
+            'El sistema agrupará todas las líneas en UNA sola usando el producto '
+            '"Viáticos" con la descripción completa de la factura.'
+        ),
+    )
 
     @api.depends('document_filename')
     def _compute_mimetype(self):
@@ -280,7 +315,7 @@ class PurchaseAIWizard(models.TransientModel):
 
     vendor_nit      = fields.Char(string='NIT Proveedor')
     vendor_name_raw = fields.Char(string='Nombre según Factura')
-    vendor_id = fields.Many2one(
+    vendor_id       = fields.Many2one(
         'res.partner', string='Proveedor en Odoo',
         domain=[('supplier_rank', '>', 0)],
     )
@@ -310,25 +345,31 @@ class PurchaseAIWizard(models.TransientModel):
 
     line_ids = fields.One2many('purchase.ai.wizard.line', 'wizard_id', string='Líneas')
 
+    analytic_account_id = fields.Many2one(
+        'account.analytic.account',
+        string='Cuenta Analítica (toda la orden)',
+        help='Opcional. Si se selecciona, se aplica al 100% en todas las líneas de la OC.',
+    )
+
     approve_vendor_ok  = fields.Boolean(string='✅ Proveedor verificado')
     approve_lines_ok   = fields.Boolean(string='✅ Líneas y productos verificados')
     approve_amounts_ok = fields.Boolean(string='✅ Montos verificados')
     approve_notes      = fields.Text(string='Notas de aprobación (opcional)')
 
+    unmatched_count        = fields.Integer(compute='_compute_readiness')
     all_lines_have_product = fields.Boolean(compute='_compute_readiness')
-    unmatched_count = fields.Integer(compute='_compute_readiness')
 
     @api.depends('line_ids', 'line_ids.product_id')
     def _compute_readiness(self):
         for rec in self:
             without = rec.line_ids.filtered(lambda l: not l.product_id)
-            rec.unmatched_count = len(without)
+            rec.unmatched_count        = len(without)
             rec.all_lines_have_product = len(without) == 0
 
     purchase_order_id = fields.Many2one('purchase.order', readonly=True)
 
     # ════════════════════════════════════════════════════════════════
-    # STAGE 1 → 2
+    # STAGE 1 → 2 — Main analysis entry point
     # ════════════════════════════════════════════════════════════════
     def action_analyze_with_ai(self):
         self.ensure_one()
@@ -338,7 +379,9 @@ class PurchaseAIWizard(models.TransientModel):
         api_key = self._get_api_key()
         model   = self._get_model()
 
-        _logger.info('Kesiyos AI P1: extracting %s', self.document_filename)
+        _logger.info('Kesiyos AI: extracting %s (viáticos=%s)',
+                     self.document_filename, self.is_viaticos)
+
         raw = self._call_claude_api(api_key, {
             'model': model, 'max_tokens': 2048,
             'messages': [{'role': 'user', 'content': [
@@ -347,6 +390,7 @@ class PurchaseAIWizard(models.TransientModel):
             ]}],
         })
         self.ai_raw_json = raw
+
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
@@ -354,24 +398,111 @@ class PurchaseAIWizard(models.TransientModel):
 
         self._populate_header(data)
         invoice_lines = data.get('lines') or []
-        line_vals = self._build_line_vals(invoice_lines)
 
-        catalog = self._get_product_catalog()
-        _logger.info('Kesiyos AI P2: matching %d lines vs %d products',
-                     len(invoice_lines), len(catalog))
-        if catalog and invoice_lines:
-            try:
-                matches = self._run_matching(api_key, model, invoice_lines, catalog)
-                self.ai_matching_json = json.dumps(matches, ensure_ascii=False, indent=2)
-                line_vals = self._apply_matches(line_vals, matches)
-            except Exception as e:
-                _logger.warning('Matching failed: %s', e)
-                self.ai_error_message = 'Matching falló: %s' % e
+        if self.is_viaticos:
+            # ── VIÁTICOS PATH ──────────────────────────────────────
+            # Collapse everything into one line, no matching needed.
+            line_vals = self._build_viaticos_line(invoice_lines)
+            self.line_ids = line_vals
+            self.matching_summary = (
+                '<div style="padding:8px;background:#d1ecf1;'
+                'border-left:4px solid #17a2b8;border-radius:4px;">'
+                '💼 <b>Modo Viáticos activado.</b> Todas las líneas agrupadas '
+                'en un solo gasto general — sin matching de productos.'
+                '</div>'
+            )
+        else:
+            # ── NORMAL PATH ────────────────────────────────────────
+            line_vals = self._build_line_vals(invoice_lines)
+            catalog   = self._get_product_catalog()
+            _logger.info('Kesiyos AI: matching %d lines vs %d products',
+                         len(invoice_lines), len(catalog))
+            if catalog and invoice_lines:
+                try:
+                    matches = self._run_matching(api_key, model, invoice_lines, catalog)
+                    self.ai_matching_json = json.dumps(
+                        matches, ensure_ascii=False, indent=2
+                    )
+                    line_vals = self._apply_matches(line_vals, matches)
+                except Exception as e:
+                    _logger.warning('Matching failed: %s', e)
+                    self.ai_error_message = 'Matching falló: %s' % e
 
-        self.line_ids = line_vals
-        self.matching_summary = self._summary_html(self.line_ids)
+            self.line_ids = line_vals
+            self.matching_summary = self._summary_html(self.line_ids)
+
         self.state = 'review'
         return self._reopen()
+
+    # ════════════════════════════════════════════════════════════════
+    # Viáticos line builder
+    # ════════════════════════════════════════════════════════════════
+    def _build_viaticos_line(self, invoice_lines):
+        """
+        Collapse all invoice lines into ONE wizard line:
+        - Product  = Viáticos service product
+        - Qty      = 1
+        - Price    = total_amount (full invoice total)
+        - Description = all individual line descriptions joined
+        """
+        viat_product = self._get_viaticos_product()
+        tax          = self._default_tax()
+
+        # Build a readable multi-line description from all invoice lines
+        desc_parts = []
+        for i, line in enumerate(invoice_lines, 1):
+            d    = line.get('description') or ''
+            qty  = line.get('quantity', '')
+            uom  = line.get('unit_of_measure', '')
+            price = line.get('unit_price', '')
+            part = f'{i}. {d}'
+            if qty or price:
+                detail = ' | '.join(filter(None, [
+                    ('x%s %s' % (qty, uom)).strip() if qty else '',
+                    ('Q%.2f' % float(price)) if price else '',
+                ]))
+                part += ' (%s)' % detail if detail else ''
+            desc_parts.append(part)
+
+        full_description = '\n'.join(desc_parts) if desc_parts else 'Viáticos / Gastos Generales'
+
+        uom = viat_product.uom_po_id or viat_product.uom_id
+        lv  = {
+            'product_id':            viat_product.id,
+            'description':           full_description,
+            'quantity':              1.0,
+            'unit_price':            self.total_amount or self.subtotal_before_tax or 0.0,
+            'match_confidence':      'manual',
+            'match_score':           100,
+            'match_reason':          '💼 Agrupado como Viáticos / Gasto General',
+            'suggested_product_name': '',
+        }
+        if uom:
+            lv['uom_id'] = uom.id
+        if tax:
+            lv['tax_ids'] = [(6, 0, tax.ids)]
+
+        return [(0, 0, lv)]
+
+    def _get_viaticos_product(self):
+        """Find the Viáticos service product — KES-VIAT first, then by name."""
+        p = self.env['product.product'].search(
+            [('default_code', '=', 'KES-VIAT'), ('purchase_ok', '=', True)], limit=1
+        )
+        if not p:
+            p = self.env['product.product'].search(
+                [('name', 'ilike', 'viático'), ('type', '=', 'service'),
+                 ('purchase_ok', '=', True)], limit=1
+            )
+        if not p:
+            p = self.env['product.product'].create({
+                'name':         'Viáticos / Gasto General',
+                'default_code': 'KES-VIAT',
+                'type':         'service',
+                'purchase_ok':  True,
+                'sale_ok':      False,
+            })
+        return p
 
     # ════════════════════════════════════════════════════════════════
     # Vendor helpers
@@ -381,7 +512,6 @@ class PurchaseAIWizard(models.TransientModel):
         nit = (self.vendor_nit or '').strip()
         if not nit:
             raise UserError(_('Ingresa el NIT del proveedor primero.'))
-
         clean = nit.replace('-', '').replace(' ', '')
         partner = self.env['res.partner'].search(
             [('vat', 'in', [nit, clean]), ('supplier_rank', '>', 0)], limit=1
@@ -390,7 +520,6 @@ class PurchaseAIWizard(models.TransientModel):
             self.vendor_id    = partner.id
             self.vendor_state = 'found'
             return self._reopen()
-
         if self.vendor_name_raw:
             partner = self.env['res.partner'].search(
                 [('name', 'ilike', self.vendor_name_raw),
@@ -400,7 +529,6 @@ class PurchaseAIWizard(models.TransientModel):
                 self.vendor_id    = partner.id
                 self.vendor_state = 'name_match'
                 return self._reopen()
-
         self.vendor_id    = False
         self.vendor_state = 'not_found'
         return self._reopen()
@@ -412,10 +540,8 @@ class PurchaseAIWizard(models.TransientModel):
             raise UserError(_('No hay nombre de proveedor disponible.'))
         if self.vendor_id:
             raise UserError(_('Ya hay un proveedor asignado.'))
-
         nit   = (self.vendor_nit or '').strip()
         clean = nit.replace('-', '').replace(' ', '')
-
         if nit:
             existing = self.env['res.partner'].search(
                 [('vat', 'in', [nit, clean])], limit=1
@@ -424,7 +550,6 @@ class PurchaseAIWizard(models.TransientModel):
                 self.vendor_id    = existing.id
                 self.vendor_state = 'found'
                 return self._reopen()
-
         partner = self.env['res.partner'].create({
             'name':          name,
             'vat':           nit or False,
@@ -456,7 +581,6 @@ class PurchaseAIWizard(models.TransientModel):
             errors.append(_('• No hay líneas de detalle.'))
         if errors:
             raise ValidationError('\n'.join(errors))
-
         self.state = 'approve'
         return self._reopen()
 
@@ -469,11 +593,10 @@ class PurchaseAIWizard(models.TransientModel):
         return self._reopen()
 
     # ════════════════════════════════════════════════════════════════
-    # STAGE 3 → 4  — PO created in DRAFT (not confirmed)
+    # STAGE 3 → 4  — PO created in DRAFT
     # ════════════════════════════════════════════════════════════════
     def action_approve_and_create_po(self):
         self.ensure_one()
-
         if not (self.approve_vendor_ok and self.approve_lines_ok and self.approve_amounts_ok):
             raise ValidationError(_(
                 'Debes marcar los tres checks de aprobación antes de confirmar.\n'
@@ -485,12 +608,16 @@ class PurchaseAIWizard(models.TransientModel):
         tax  = self._default_tax()
         misc = self._misc_product()
 
+        analytic_dist = False
+        if self.analytic_account_id:
+            analytic_dist = {str(self.analytic_account_id.id): 100.0}
+
         po_lines = []
         for line in self.line_ids:
-            product = line.product_id or misc
-            uom     = line.uom_id or product.uom_po_id or product.uom_id
-            taxes   = line.tax_ids or (tax if tax else self.env['account.tax'])
-            po_lines.append((0, 0, {
+            product   = line.product_id or misc
+            uom       = line.uom_id or product.uom_po_id or product.uom_id
+            taxes     = line.tax_ids or (tax if tax else self.env['account.tax'])
+            line_vals = {
                 'product_id':   product.id,
                 'name':         line.description or product.name,
                 'product_qty':  line.quantity,
@@ -498,7 +625,10 @@ class PurchaseAIWizard(models.TransientModel):
                 'price_unit':   line.unit_price,
                 'taxes_id':     [(6, 0, taxes.ids)],
                 'date_planned': fields.Date.today(),
-            }))
+            }
+            if analytic_dist:
+                line_vals['analytic_distribution'] = analytic_dist
+            po_lines.append((0, 0, line_vals))
 
         po = self.env['purchase.order'].create({
             'partner_id':  self.vendor_id.id,
@@ -509,7 +639,6 @@ class PurchaseAIWizard(models.TransientModel):
             'order_line':  po_lines,
         })
 
-        # Attach original document
         if self.document_file and self.document_filename:
             self.env['ir.attachment'].create({
                 'name':      self.document_filename,
@@ -519,10 +648,8 @@ class PurchaseAIWizard(models.TransientModel):
                 'mimetype':  self.document_mimetype,
             })
 
-        # ── DRAFT — user confirms manually from the PO ──
-        # po.button_confirm() is intentionally NOT called here.
-        _logger.info('Kesiyos AI: PO %s created in DRAFT for %s', po.name, self.vendor_id.name)
-
+        _logger.info('Kesiyos AI: PO %s DRAFT — %s (viáticos=%s)',
+                     po.name, self.vendor_id.name, self.is_viaticos)
         self.purchase_order_id = po.id
         self.state = 'done'
         return self._reopen()
@@ -538,7 +665,7 @@ class PurchaseAIWizard(models.TransientModel):
         }
 
     # ════════════════════════════════════════════════════════════════
-    # Product catalog + matching
+    # Internal helpers
     # ════════════════════════════════════════════════════════════════
     def _get_product_catalog(self):
         products = self.env['product.product'].search(
@@ -633,17 +760,15 @@ class PurchaseAIWizard(models.TransientModel):
             uom_name = (line.get('unit_of_measure') or '').strip().lower()
             uom = False
             if uom_name:
-                uom = self.env['uom.uom'].search(
-                    [('name', 'ilike', uom_name)], limit=1
-                )
+                uom = self.env['uom.uom'].search([('name', 'ilike', uom_name)], limit=1)
             lv = {
-                'description':           line.get('description') or '',
-                'product_code':          line.get('product_code') or '',
-                'quantity':              float(line.get('quantity') or 1),
-                'unit_price':            float(line.get('unit_price') or 0),
-                'match_confidence':      'none',
-                'match_score':           0,
-                'match_reason':          '',
+                'description':            line.get('description') or '',
+                'product_code':           line.get('product_code') or '',
+                'quantity':               float(line.get('quantity') or 1),
+                'unit_price':             float(line.get('unit_price') or 0),
+                'match_confidence':       'none',
+                'match_score':            0,
+                'match_reason':           '',
                 'suggested_product_name': '',
             }
             if uom: lv['uom_id']  = uom.id
@@ -656,16 +781,16 @@ class PurchaseAIWizard(models.TransientModel):
             idx = m.get('line_index')
             if idx is None or idx >= len(line_vals):
                 continue
-            lv = line_vals[idx][2]
+            lv         = line_vals[idx][2]
             confidence = m.get('confidence', 'none')
             score      = m.get('confidence_score', 0)
             reason     = m.get('reason', '')
             prod_id    = m.get('product_odoo_id')
             suggested  = m.get('suggested_new_product_name') or ''
 
-            lv['match_confidence']      = confidence
-            lv['match_score']           = score
-            lv['match_reason']          = reason
+            lv['match_confidence']       = confidence
+            lv['match_score']            = score
+            lv['match_reason']           = reason
             lv['suggested_product_name'] = suggested
 
             if prod_id and confidence in ('high', 'medium'):
@@ -707,11 +832,13 @@ class PurchaseAIWizard(models.TransientModel):
 
     def _po_notes(self):
         parts = []
+        if self.is_viaticos:         parts.append('💼 VIÁTICOS / GASTO GENERAL')
         if self.notes:               parts.append(self.notes)
         if self.vendor_nit:          parts.append('NIT: ' + self.vendor_nit)
         if self.fel_uuid:            parts.append('UUID FEL: ' + self.fel_uuid)
         if self.fel_serie:           parts.append('Serie FEL: ' + self.fel_serie)
         if self.approve_notes:       parts.append('Aprobación: ' + self.approve_notes)
+        if self.analytic_account_id: parts.append('Analítica: ' + self.analytic_account_id.name)
         if self.subtotal_before_tax: parts.append('Subtotal s/IVA: Q %.2f' % self.subtotal_before_tax)
         if self.tax_amount:          parts.append('IVA: Q %.2f' % self.tax_amount)
         return '\n'.join(parts)
@@ -722,11 +849,11 @@ class PurchaseAIWizard(models.TransientModel):
         )
         if not p:
             p = self.env['product.product'].create({
-                'name':        'Compra Miscelánea / Genérico',
+                'name':         'Compra Miscelánea / Genérico',
                 'default_code': 'KES-MISC',
-                'type':        'service',
-                'purchase_ok': True,
-                'sale_ok':     False,
+                'type':         'service',
+                'purchase_ok':  True,
+                'sale_ok':      False,
             })
         return p
 
@@ -758,7 +885,7 @@ class PurchaseAIWizard(models.TransientModel):
         raise UserError(_('Formato no soportado: %s') % self.document_filename)
 
     def _call_claude_api(self, api_key, payload):
-        url = 'https://api.anthropic.com/v1/messages'
+        url     = 'https://api.anthropic.com/v1/messages'
         headers = {
             'Content-Type':      'application/json',
             'x-api-key':         api_key,

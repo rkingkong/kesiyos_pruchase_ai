@@ -5,29 +5,42 @@
         <field name="name">purchase.ai.product.wizard.form</field>
         <field name="model">purchase.ai.product.wizard</field>
         <field name="arch" type="xml">
-            <form string="🆕 Crear Nuevo Producto">
+            <form string="📦 Asignar Producto a Línea">
                 <sheet>
-                    <div class="kes-info" style="margin-bottom:16px;padding:10px;background:#fff3cd;border-left:4px solid #ffc107;border-radius:4px;">
+
+                    <div style="padding:10px;background:#fff3cd;border-left:4px solid #ffc107;border-radius:4px;margin-bottom:16px;">
                         <b>Producto no encontrado en el catálogo.</b><br/>
-                        Completa los datos para crearlo en Odoo.
+                        Elige qué hacer con esta línea de la factura.
                     </div>
 
                     <group>
-                        <group string="Datos del Producto">
-                            <field name="product_name" string="Nombre del Producto"/>
-                            <field name="product_type" string="Tipo de Producto" widget="radio"/>
-                            <field name="categ_id" string="Categoría"/>
-                            <field name="uom_id" string="Unidad de Medida"/>
-                        </group>
-                        <group string="Referencia de la Factura">
-                            <field name="line_id" readonly="1" string="Línea de factura"/>
-                        </group>
+                        <field name="action" widget="radio" string="¿Qué hacer?"/>
                     </group>
+
+                    <!-- Viáticos info box -->
+                    <div invisible="action != 'viaticos'"
+                         style="padding:10px;background:#d1ecf1;border-left:4px solid #17a2b8;border-radius:4px;margin:8px 0;">
+                        <b>💼 Viáticos / Gasto General</b><br/>
+                        Se asignará el producto genérico <b>KES-VIAT</b> a esta línea.<br/>
+                        Úsalo para gastos de dueños, viáticos, representación u otros costos
+                        que no corresponden a un producto específico del catálogo.
+                    </div>
+
+                    <!-- New product fields -->
+                    <group invisible="action != 'create'" string="Datos del Nuevo Producto">
+                        <field name="product_name" string="Nombre"/>
+                        <field name="product_type" string="Tipo" widget="radio"/>
+                        <field name="categ_id"     string="Categoría"/>
+                        <field name="uom_id"       string="Unidad de Medida"/>
+                    </group>
+
+                    <field name="line_id" invisible="1"/>
+
                 </sheet>
                 <footer>
-                    <button name="action_confirm_create"
+                    <button name="action_confirm"
                             type="object"
-                            string="✅ Crear Producto"
+                            string="✅ Confirmar"
                             class="btn-primary"/>
                     <button string="Cancelar" class="btn-secondary" special="cancel"/>
                 </footer>
