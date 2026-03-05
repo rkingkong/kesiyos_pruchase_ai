@@ -1,0 +1,338 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!--
+    Odoo 17 Fixes applied in this file:
+    ══════════════════════════════════════════════════════════════════
+    1. invoice_date: removed unconditional required="1".
+       Now: required="state in ('review', 'approve')" — only mandatory
+       AFTER the AI has run. Previously Odoo 17 validated it client-side
+       before action_analyze_with_ai() fired → "Campos no válidos: Fecha de Factura"
+
+    2. <tree> → <list> in the One2many lines widget (Odoo 17 rename).
+
+    3. "Volver a Revisar" footer button: changed from broken type="action"
+       (which opened a NEW wizard, losing all data) to type="object"
+       calling action_go_back_to_review().
+
+    4. vendor_id no_quick_create: old dict syntax updated for Odoo 17.
+
+    5. All invisible/required conditions use direct Python expressions
+       (no attrs={} which is deprecated in Odoo 17).
+
+    6. unmatched_count decoration moved into context where it is valid.
+    ══════════════════════════════════════════════════════════════════
+    -->
+
+    <!-- ACTION — must exist before menus reference it -->
+    <record id="action_purchase_ai_wizard" model="ir.actions.act_window">
+        <field name="name">📄 Escanear Factura con IA</field>
+        <field name="res_model">purchase.ai.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+        <field name="context">{}</field>
+    </record>
+
+    <record id="view_purchase_ai_wizard_form" model="ir.ui.view">
+        <field name="name">purchase.ai.wizard.form</field>
+        <field name="model">purchase.ai.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Escanear Factura → Orden de Compra">
+
+                <header>
+                    <!-- statusbar — state widget shows the pipeline progress -->
+                    <field name="state" widget="statusbar"
+                           statusbar_visible="upload,review,approve,done"/>
+                </header>
+
+                <sheet>
+
+                    <!-- ══════════════════════════════════════════════
+                         STAGE 1 — UPLOAD
+                         ══════════════════════════════════════════════ -->
+                    <group invisible="state != 'upload'">
+                        <group string="📄 Subir Documento">
+                            <field name="document_file"
+                                   widget="binary"
+                                   string="Factura / Recibo"
+                                   filename="document_filename"
+                                   required="state == 'upload'"/>
+                            <field name="document_filename" invisible="1"/>
+                            <field name="document_mimetype" invisible="1"/>
+                        </group>
+                        <group string="Cómo funciona">
+                            <div class="kes-info">
+                                <b>Formatos:</b> PDF · JPG · PNG · WEBP<br/>
+                                <b>Fase 1 — Extracción:</b> Claude lee la factura y extrae
+                                proveedor, NIT, UUID FEL, líneas, IVA y totales.<br/>
+                                <b>Fase 2 — Matching IA:</b> Compara cada línea contra tu
+                                catálogo de productos con nivel de confianza.<br/>
+                                <b>Fase 3 — Revisión:</b> Tú corriges, buscas o creas los
+                                productos y el proveedor que falten.<br/>
+                                <b>Fase 4 — Aprobación:</b> Un solo clic confirma la
+                                Orden de Compra — sin borradores incompletos.
+                            </div>
+                        </group>
+                    </group>
+
+                    <!-- ══════════════════════════════════════════════
+                         STAGE 2 — REVIEW
+                         ══════════════════════════════════════════════ -->
+                    <group invisible="state not in ('review', 'approve')">
+
+                        <!-- Matching summary banner -->
+                        <div invisible="not matching_summary" colspan="4">
+                            <field name="matching_summary" widget="html" nolabel="1"/>
+                        </div>
+
+                        <!-- ── Vendor block ── -->
+                        <group string="🏪 Proveedor" colspan="4">
+                            <group>
+                                <field name="vendor_nit" string="NIT"/>
+                                <field name="vendor_name_raw" string="Nombre (factura)"/>
+                                <!--
+                                    FIX: widget="badge" decoration-* works on statusbar-like
+                                    fields in form view in Odoo 17
+                                -->
+                                <field name="vendor_state" widget="badge"
+                                       decoration-success="vendor_state in ('found', 'created', 'manual')"
+                                       decoration-warning="vendor_state == 'name_match'"
+                                       decoration-danger="vendor_state == 'not_found'"/>
+                            </group>
+                            <group>
+                                <!--
+                                    FIX Odoo 17: no_quick_create is now a boolean in options,
+                                    syntax unchanged but keeping False (allow quick create)
+                                -->
+                                <field name="vendor_id"
+                                       string="Proveedor en Odoo"
+                                       options="{'no_quick_create': false}"
+                                       domain="[('supplier_rank', '&gt;', 0)]"/>
+                                <field name="vendor_address" optional="show"/>
+                            </group>
+                            <div colspan="4" style="margin-top:4px">
+                                <button name="action_lookup_vendor_by_nit"
+                                        type="object"
+                                        string="🔍 Buscar por NIT"
+                                        class="btn-secondary btn-sm"/>
+                                <button name="action_create_vendor"
+                                        type="object"
+                                        string="➕ Crear Proveedor"
+                                        class="btn-warning btn-sm"
+                                        invisible="vendor_id != False"/>
+                            </div>
+                        </group>
+
+                        <!-- ── Invoice header ── -->
+                        <group string="📋 Factura">
+                            <field name="invoice_number"/>
+                            <!--
+                                FIX #1 — THE MAIN BUG:
+                                Previously this had required="1" (unconditional).
+                                In Odoo 17, the client validates ALL required fields
+                                before firing the button action — even fields inside
+                                invisible groups. So clicking "Analizar con IA" (stage 1)
+                                triggered validation and showed "Campos no válidos: Fecha de Factura"
+                                because the field was empty (AI hadn't run yet).
+
+                                Fix: make required conditional on being in review/approve stage.
+                                The field is only visible in those stages anyway, so it's
+                                validated exactly when the user needs to fill it.
+                            -->
+                            <field name="invoice_date"
+                                   required="state in ('review', 'approve')"/>
+                            <field name="fel_uuid" string="UUID FEL / SAT" optional="show"/>
+                            <field name="fel_serie" string="Serie DTE" optional="show"/>
+                            <field name="currency_id" options="{'no_open': True}"/>
+                        </group>
+                        <group string="💰 Totales">
+                            <field name="subtotal_before_tax" string="Subtotal s/IVA"/>
+                            <field name="tax_amount" string="IVA"/>
+                            <field name="total_amount" string="Total"/>
+                        </group>
+
+                        <!-- ── Lines ── -->
+                        <notebook colspan="4">
+                            <page string="📦 Líneas de Factura">
+
+                                <!--
+                                    FIX #2: <tree> renamed to <list> in Odoo 17.
+                                    editable="bottom" still works.
+                                -->
+                                <field name="line_ids" nolabel="1">
+                                    <list editable="bottom"
+                                          decoration-success="match_confidence == 'high'"
+                                          decoration-warning="match_confidence == 'medium'"
+                                          decoration-danger="match_confidence in ('low', 'none')"
+                                          decoration-info="match_confidence in ('manual', 'created')">
+
+                                        <field name="description" string="Descripción"/>
+                                        <field name="product_id"
+                                               string="Producto Odoo"
+                                               domain="[('purchase_ok','=',True)]"
+                                               options="{'no_quick_create': false}"
+                                               widget="many2one"/>
+                                        <field name="match_confidence" string="Confianza" optional="show"/>
+                                        <field name="match_score"      string="%" optional="show"/>
+                                        <field name="match_reason"     string="Razón" optional="show"/>
+                                        <field name="suggested_product_name" string="Nombre sugerido" optional="show"/>
+                                        <button name="action_create_product"
+                                                type="object"
+                                                string="🆕"
+                                                title="Crear producto desde sugerencia"
+                                                invisible="product_id != False"
+                                                class="btn-sm btn-outline-primary"/>
+                                        <field name="product_code" string="Cód. Proveedor" optional="hide"/>
+                                        <field name="quantity" string="Cant."/>
+                                        <field name="uom_id"   string="UOM" optional="show"/>
+                                        <field name="unit_price" string="P. Unit."/>
+                                        <field name="line_total" string="Subtotal" optional="show"/>
+                                        <field name="tax_ids"
+                                               widget="many2many_tags"
+                                               optional="show"
+                                               domain="[('type_tax_use','=','purchase')]"/>
+                                        <field name="needs_product" invisible="1"/>
+                                    </list>
+                                </field>
+
+                                <!-- Unmatched warning — shown below the list -->
+                                <div invisible="unmatched_count == 0"
+                                     style="margin-top:6px;color:#dc3545;font-size:0.9em">
+                                    ⚠️ <field name="unmatched_count" nolabel="1"
+                                              style="display:inline;font-weight:bold"/> línea(s) sin producto asignado.
+                                    Asígnales un producto manualmente o usa el botón 🆕.
+                                </div>
+                            </page>
+
+                            <page string="🤖 Debug IA">
+                                <group string="Fase 1 — Extracción (JSON crudo)">
+                                    <field name="ai_raw_json" widget="text" readonly="1" nolabel="1"/>
+                                </group>
+                                <group string="Fase 2 — Matching (JSON crudo)">
+                                    <field name="ai_matching_json" widget="text" readonly="1" nolabel="1"/>
+                                </group>
+                                <div invisible="not ai_error_message" style="color:red;padding:8px">
+                                    <b>Error:</b> <field name="ai_error_message" readonly="1" nolabel="1"/>
+                                </div>
+                            </page>
+                        </notebook>
+
+                    </group>
+
+                    <!-- ══════════════════════════════════════════════
+                         STAGE 3 — APPROVE
+                         ══════════════════════════════════════════════ -->
+                    <group invisible="state != 'approve'">
+
+                        <div class="kes-info" colspan="4" style="margin-bottom:12px">
+                            <b>Revisa los puntos a continuación y marca cada casilla.</b><br/>
+                            La Orden de Compra se creará y confirmará inmediatamente al aprobar.
+                        </div>
+
+                        <!-- Read-only summary -->
+                        <group string="📋 Resumen" colspan="4">
+                            <group>
+                                <field name="vendor_id"      readonly="1" string="Proveedor"/>
+                                <field name="vendor_nit"     readonly="1"/>
+                                <field name="invoice_number" readonly="1"/>
+                                <field name="invoice_date"   readonly="1"/>
+                            </group>
+                            <group>
+                                <field name="subtotal_before_tax" readonly="1"/>
+                                <field name="tax_amount"          readonly="1"/>
+                                <field name="total_amount"        readonly="1"/>
+                                <!-- FIX #4: decoration on a scalar field outside list context
+                                     is not supported. Show as plain integer + inline warning text. -->
+                                <field name="unmatched_count" readonly="1" string="Líneas sin producto"/>
+                                <div invisible="unmatched_count == 0"
+                                     style="color:#dc3545;font-size:0.85em">
+                                    ⚠️ Hay líneas sin producto — se usará KES-MISC (genérico).
+                                </div>
+                            </group>
+                        </group>
+
+                        <!-- Approval checklist -->
+                        <group string="✅ Checklist de Aprobación" colspan="4">
+                            <field name="approve_vendor_ok"  string="Proveedor correcto y NIT verificado"/>
+                            <field name="approve_lines_ok"   string="Líneas, productos y cantidades verificadas"/>
+                            <field name="approve_amounts_ok" string="Montos, IVA y total verificados"/>
+                            <field name="approve_notes"
+                                   string="Notas (opcional)"
+                                   placeholder="Autorizado por... / Observaciones..."/>
+                        </group>
+
+                    </group>
+
+                    <!-- ══════════════════════════════════════════════
+                         STAGE 4 — DONE
+                         ══════════════════════════════════════════════ -->
+                    <group invisible="state != 'done'">
+                        <div colspan="4" style="padding:16px;background:#d4edda;border-radius:6px;border:1px solid #c3e6cb">
+                            <h4 style="color:#155724">✅ Orden de Compra Confirmada</h4>
+                            <p style="color:#155724;margin:0">
+                                La orden fue creada y confirmada exitosamente.
+                                Ya está lista para recibir mercadería.
+                            </p>
+                        </div>
+                        <field name="purchase_order_id" readonly="1" colspan="4"/>
+                    </group>
+
+                </sheet>
+
+                <!-- ══════════════════════════════════════════════════
+                     FOOTER BUTTONS
+                     ══════════════════════════════════════════════════ -->
+                <footer>
+                    <!-- Stage 1 -->
+                    <button name="action_analyze_with_ai"
+                            type="object"
+                            string="🔍 Analizar con IA"
+                            class="btn-primary"
+                            invisible="state != 'upload'"/>
+
+                    <!-- Stage 2 -->
+                    <button name="action_analyze_with_ai"
+                            type="object"
+                            string="🔄 Re-Analizar"
+                            class="btn-secondary"
+                            invisible="state != 'review'"/>
+                    <button name="action_proceed_to_approve"
+                            type="object"
+                            string="➡️ Proceder a Aprobar"
+                            class="btn-primary"
+                            invisible="state != 'review'"/>
+
+                    <!-- Stage 3 -->
+                    <!--
+                        FIX #3: Previously used type="action" with action_purchase_ai_wizard
+                        reference, which opened a BRAND NEW empty wizard — losing all
+                        extracted AI data. Replaced with type="object" calling
+                        action_go_back_to_review() which sets state='review' on the
+                        SAME wizard record and reopens it.
+                    -->
+                    <button name="action_go_back_to_review"
+                            type="object"
+                            string="← Volver a Revisar"
+                            class="btn-secondary"
+                            invisible="state != 'approve'"/>
+                    <button name="action_approve_and_create_po"
+                            type="object"
+                            string="✅ Aprobar y Crear Orden de Compra"
+                            class="btn-success"
+                            invisible="state != 'approve'"/>
+
+                    <!-- Stage 4 -->
+                    <button name="action_open_po"
+                            type="object"
+                            string="📋 Ver Orden de Compra"
+                            class="btn-primary"
+                            invisible="state != 'done'"/>
+
+                    <button string="Cerrar" class="btn-secondary" special="cancel"/>
+                </footer>
+
+            </form>
+        </field>
+    </record>
+
+</odoo>

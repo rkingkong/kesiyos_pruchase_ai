@@ -1,0 +1,27 @@
+/* Kesiyos AI Purchase Scanner — wizard styles */
+
+.kes-info {
+    background: #e8f4fd;
+    border-left: 4px solid #0d6efd;
+    padding: 12px 16px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    line-height: 1.6;
+}
+
+.kes-info b {
+    color: #0d6efd;
+}
+
+.kes-success {
+    background: #d4edda;
+    border: 1px solid #c3e6cb;
+    border-radius: 6px;
+    padding: 16px;
+    color: #155724;
+}
+
+.kes-success h4 {
+    margin-top: 0;
+    color: #155724;
+}

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <menuitem
+        id="menu_purchase_ai_root"
+        name="AI Tools"
+        parent="purchase.menu_purchase_root"
+        sequence="90"
+        groups="purchase.group_purchase_user"/>
+
+    <menuitem
+        id="menu_purchase_ai_scan"
+        name="📄 Escanear Factura con IA"
+        parent="menu_purchase_ai_root"
+        action="kesiyos_purchase_ai.action_purchase_ai_wizard"
+        sequence="1"
+        groups="purchase.group_purchase_user"/>
+
+</odoo>
